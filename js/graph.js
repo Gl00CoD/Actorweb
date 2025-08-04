@@ -367,11 +367,20 @@ function updateLinkPositions(linkElements) {
 }
 
 /**
- * Update node positions
+ * Update node positions - FIXED VERSION
  */
 function updateNodePositions(nodeElements) {
-    nodeElements
-        .attr('transform', d => `translate(${d.x},${d.y})`);
+    nodeElements.each(function(d) {
+        const group = d3.select(this);
+        
+        // Update the group transform
+        group.attr('transform', `translate(${d.x},${d.y})`);
+        
+        // CRITICAL FIX: Also update circle cx/cy attributes
+        group.select('circle')
+            .attr('cx', 0)  // Relative to group position
+            .attr('cy', 0); // Relative to group position
+    });
 }
 
 // ===== ACTOR POPUP FUNCTIONALITY =====
