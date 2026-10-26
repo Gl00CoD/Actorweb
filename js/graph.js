@@ -1,697 +1,300 @@
-// ========================================
-// ACTOR WEB - GRAPH VISUALIZATION
-// ========================================
+// The web itself: a title in the middle, its cast around it, and the titles
+// each actor went on to (or came from) at the edge. Titles shared by several
+// actors pull inward and become knots in the web.
+(function () {
+  const AW = (window.AW = window.AW || {});
+  const NS = 'http://www.w3.org/2000/svg';
 
-let currentGraph = null;
-let simulation = null;
-let svg = null;
+  const R = { center: 66, actor: 30, title: 17, hub: 23 };
+  const MONO_FILLS = ['#C6CFD2', '#BAC5C9', '#D0D7D9', '#B3BFC3'];
 
-// ===== GRAPH INITIALIZATION =====
+  let svg, viewport, zoom, nodesById, current;
 
-/**
- * Initialize the graph visualization
- */
-function initializeGraph() {
-    svg = d3.select('#graph');
-    
-    if (svg.empty()) {
-        console.error('Graph SVG element not found');
-        return;
+  // ---------- helpers ----------
+  function hash(str) {
+    let h = 2166136261;
+    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return h >>> 0;
+  }
+
+  function initials(name) {
+    const words = String(name || '?').replace(/[^\p{L}\s'-]/gu, ' ').trim().split(/\s+/).filter(Boolean);
+    if (!words.length) return '?';
+    if (words[0].toLowerCase() === 'the' && words.length > 1) words.shift();
+    return (words[0][0] + (words.length > 1 ? words[words.length - 1][0] : '')).toUpperCase();
+  }
+
+  // A grease-pencil loop: slightly uneven, overshoots where it started.
+  AW.pencilLoop = function (r, seed) {
+    const s = seed || 1;
+    const a0 = ((s % 360) / 360) * Math.PI * 2;
+    const turn = Math.PI * 2 * 1.09;
+    const p1 = (s % 7) / 7 * Math.PI * 2;
+    const p2 = (s % 11) / 11 * Math.PI * 2;
+    const squash = 0.92 + ((s % 13) / 13) * 0.1;
+    const pts = [];
+    const steps = 44;
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      const a = a0 + t * turn;
+      const k = r * (1 + 0.035 * Math.sin(3 * a + p1) + 0.02 * Math.sin(5 * a + p2) + t * 0.06);
+      pts.push([Math.cos(a) * k, Math.sin(a) * k * squash]);
     }
-    
-    // Set initial dimensions
-    updateGraphDimensions();
-    
-    // Handle window resize
-    window.addEventListener('resize', handleGraphResize);
-    
-    debugLog('Graph initialized');
-}
+    return d3.line().curve(d3.curveCatmullRom.alpha(0.5))(pts);
+  };
 
-/**
- * Update graph dimensions based on window size
- */
-function updateGraphDimensions() {
-    if (!svg) return;
-    
-    const width = window.innerWidth;
-    const height = window.innerHeight;
-    
-    svg.attr('width', width).attr('height', height);
-    
-    if (simulation) {
-        simulation.force('center', d3.forceCenter(width / 2, height / 2));
-        simulation.alpha(0.3).restart();
-    }
-}
+  function el(name, attrs, parent) {
+    const n = document.createElementNS(NS, name);
+    for (const k in attrs) if (attrs[k] != null) n.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(n);
+    return n;
+  }
 
-/**
- * Handle window resize
- */
-function handleGraphResize() {
-    updateGraphDimensions();
-}
+  function truncate(s, n) {
+    return s.length > n ? s.slice(0, n - 1).trimEnd() + '…' : s;
+  }
 
-// ===== GRAPH CREATION =====
-
-/**
- * Create graph from movie/show data
- */
-function createGraph(centerMovieData) {
-    debugLog('Creating graph for:', centerMovieData.title);
-    
-    if (!centerMovieData) {
-        console.error('No movie data provided for graph creation');
-        return;
-    }
-    
-    const connections = findConnections(centerMovieData);
-    
-    // Create nodes
-    const nodes = [
-        createMainNode(centerMovieData)
-    ];
-    
+  // ---------- model ----------
+  function buildModel(web) {
+    const nodes = [];
     const links = [];
-    
-    // Add connected movies/shows as nodes
-    connections.forEach(connection => {
-        if (!nodes.find(n => n.id === connection.id)) {
-            nodes.push(createConnectedNode(connection));
+    const center = { id: web.center.key, kind: 'center', title: web.center, r: R.center, fx: 0, fy: 0 };
+    nodes.push(center);
+    const titles = new Map();
+    web.cast.forEach((m, i) => {
+      const a = { id: 'p:' + m.person.id + ':' + i, kind: 'actor', person: m.person, character: m.character, r: R.actor, index: i };
+      nodes.push(a);
+      links.push({ source: center, target: a, kind: 'cast' });
+      m.titles.forEach((t) => {
+        let n = titles.get(t.key);
+        if (!n) {
+          n = { id: t.key, kind: 'title', title: t, actors: [], r: R.title };
+          titles.set(t.key, n);
+          nodes.push(n);
         }
-        
-        // Create link between main node and connected node
-        links.push(createLink(centerMovieData.id, connection.id, connection.sharedActors));
+        n.actors.push({ person: m.person, character: t.character, actorNode: a });
+        n.title.seen = n.title.seen || t.seen;
+        links.push({ source: a, target: n, kind: 'credit' });
+      });
     });
-    
-    // Store current graph data
-    currentGraph = { nodes, links, centerMovie: centerMovieData };
-    
-    // Render the graph
-    renderGraph(nodes, links);
-    
-    debugLog('Graph created with', nodes.length, 'nodes and', links.length, 'links');
-}
+    titles.forEach((n) => { if (n.actors.length > 1) n.r = R.hub + Math.min(n.actors.length - 2, 3) * 3; });
+    return { nodes, links, center };
+  }
 
-/**
- * Create main/center node
- */
-function createMainNode(movieData) {
-    return {
-        id: movieData.id,
-        title: movieData.title,
-        type: movieData.type,
-        year: movieData.year,
-        isMain: true,
-        actors: movieData.actors,
-        key: movieData.key || movieData.id.toString()
-    };
-}
-
-/**
- * Create connected node
- */
-function createConnectedNode(movieData) {
-    return {
-        id: movieData.id,
-        title: movieData.title,
-        type: movieData.type,
-        year: movieData.year,
-        isMain: false,
-        actors: movieData.actors,
-        key: movieData.key || movieData.id.toString(),
-        sharedActors: movieData.sharedActors
-    };
-}
-
-/**
- * Create link between nodes
- */
-function createLink(sourceId, targetId, sharedActors) {
-    return {
-        source: sourceId,
-        target: targetId,
-        sharedActors: sharedActors,
-        strength: sharedActors.length
-    };
-}
-
-// ===== GRAPH RENDERING =====
-
-/**
- * Render the graph visualization
- */
-function renderGraph(nodes, links) {
-    if (!svg || !nodes || !links) {
-        console.error('Cannot render graph: missing required elements');
-        return;
-    }
-    
-    // Clear previous graph
-    svg.selectAll('*').remove();
-    
-    const width = parseInt(svg.attr('width'));
-    const height = parseInt(svg.attr('height'));
-    
-    // Create force simulation
-    simulation = createForceSimulation(nodes, links, width, height);
-    
-    // Create visual elements
-    const linkElements = createLinks(svg, links);
-    const nodeElements = createNodes(svg, nodes);
-    
-    // Add interaction handlers
-    addNodeInteractions(nodeElements);
-    
-    // Update positions on each simulation tick
-    simulation.on('tick', () => {
-        updateLinkPositions(linkElements);
-        updateNodePositions(nodeElements);
+  function layout(model) {
+    const actors = model.nodes.filter((n) => n.kind === 'actor');
+    const count = Math.max(actors.length, 1);
+    const ring = Math.max(210, count * 27);
+    actors.forEach((a, i) => {
+      a.angle = (i / count) * Math.PI * 2 - Math.PI / 2;
+      a.x = Math.cos(a.angle) * ring;
+      a.y = Math.sin(a.angle) * ring;
     });
-    
-    debugLog('Graph rendered');
-}
-
-/**
- * Create force simulation
- */
-function createForceSimulation(nodes, links, width, height) {
-    return d3.forceSimulation(nodes)
-        .force('link', d3.forceLink(links)
-            .id(d => d.id)
-            .distance(CONFIG.graph.nodeDistance)
-        )
-        .force('charge', d3.forceManyBody()
-            .strength(CONFIG.graph.nodeStrength)
-        )
-        .force('center', d3.forceCenter(width / 2, height / 2))
-        .force('collision', d3.forceCollide()
-            .radius(CONFIG.graph.collisionRadius)
-        );
-}
-
-/**
- * Create link visual elements
- */
-function createLinks(svg, links) {
-    return svg.append('g')
-        .attr('class', 'links')
-        .selectAll('line')
-        .data(links)
-        .enter()
-        .append('line')
-        .attr('class', 'link')
-        .style('stroke', getColor('primary') + '66') // Add transparency
-        .style('stroke-width', d => Math.sqrt(d.strength) * CONFIG.graph.linkWidth.multiplier)
-        .style('opacity', 0.6);
-}
-
-/**
- * Create node visual elements
- */
-function createNodes(svg, nodes) {
-    const nodeGroups = svg.append('g')
-        .attr('class', 'nodes')
-        .selectAll('g')
-        .data(nodes)
-        .enter()
-        .append('g')
-        .attr('class', d => `node ${d.isMain ? 'main' : ''}`)
-        .call(createDragBehavior());
-    
-    // Add circles
-    nodeGroups.append('circle')
-        .attr('r', d => d.isMain ? CONFIG.graph.mainNodeSize : CONFIG.graph.connectedNodeSize)
-        .style('fill', d => d.isMain ? getColor('accent') : getColor('primary'))
-        .style('stroke', getColor('text.primary'))
-        .style('stroke-width', 2);
-    
-    // Add main labels (titles)
-    nodeGroups.append('text')
-        .attr('class', 'node-label')
-        .attr('dy', 5)
-        .style('font-size', '12px')
-        .style('font-weight', 'bold')
-        .style('text-anchor', 'middle')
-        .style('fill', getColor('text.primary'))
-        .style('text-shadow', '1px 1px 2px rgba(0, 0, 0, 0.8)')
-        .style('pointer-events', 'none')
-        .text(d => truncateText(d.title, 15));
-    
-    // Add year labels
-    nodeGroups.append('text')
-        .attr('class', 'node-label')
-        .attr('dy', 18)
-        .style('font-size', '10px')
-        .style('text-anchor', 'middle')
-        .style('fill', getColor('text.secondary'))
-        .style('text-shadow', '1px 1px 2px rgba(0, 0, 0, 0.8)')
-        .style('pointer-events', 'none')
-        .text(d => `(${d.year})`);
-    
-    return nodeGroups;
-}
-
-/**
- * Add interaction behaviors to nodes
- */
-function addNodeInteractions(nodeElements) {
-    nodeElements
-        .on('mouseover', handleNodeMouseOver)
-        .on('mouseout', handleNodeMouseOut)
-        .on('click', handleNodeClick);
-}
-
-/**
- * Create drag behavior
- */
-function createDragBehavior() {
-    return d3.drag()
-        .on('start', dragStarted)
-        .on('drag', dragged)
-        .on('end', dragEnded);
-}
-
-// ===== INTERACTION HANDLERS =====
-
-/**
- * Handle node mouse over
- */
-function handleNodeMouseOver(event, d) {
-    // Enhance visual feedback
-    d3.select(this).select('circle')
-        .transition()
-        .duration(CONFIG.animations.nodeHover * 1000)
-        .attr('r', d => (d.isMain ? CONFIG.graph.mainNodeSize : CONFIG.graph.connectedNodeSize) * 1.2)
-        .style('filter', `drop-shadow(0 0 15px ${getColor('primary')})`);
-    
-    // Highlight connected links
-    if (currentGraph) {
-        svg.selectAll('.link')
-            .style('opacity', link => 
-                (link.source.id === d.id || link.target.id === d.id) ? 1 : 0.2
-            );
-    }
-}
-
-/**
- * Handle node mouse out
- */
-function handleNodeMouseOut(event, d) {
-    // Reset visual state
-    d3.select(this).select('circle')
-        .transition()
-        .duration(CONFIG.animations.nodeHover * 1000)
-        .attr('r', d => d.isMain ? CONFIG.graph.mainNodeSize : CONFIG.graph.connectedNodeSize)
-        .style('filter', d => d.isMain ? 
-            `drop-shadow(0 0 10px ${getColor('accent')})` : 
-            `drop-shadow(0 0 5px ${getColor('primary')})`
-        );
-    
-    // Reset link opacity
-    svg.selectAll('.link')
-        .style('opacity', 0.6);
-}
-
-/**
- * Handle node click
- */
-function handleNodeClick(event, d) {
-    if (!d.isMain && currentGraph) {
-        showActorPopup(event, d, currentGraph.centerMovie);
-    } else if (d.isMain) {
-        // Could add functionality for main node clicks (e.g., show movie details)
-        debugLog('Main node clicked:', d.title);
-    }
-}
-
-// ===== DRAG BEHAVIORS =====
-
-/**
- * Handle drag start
- */
-function dragStarted(event, d) {
-    if (!event.active) simulation.alphaTarget(0.3).restart();
-    d.fx = d.x;
-    d.fy = d.y;
-}
-
-/**
- * Handle dragging
- */
-function dragged(event, d) {
-    d.fx = event.x;
-    d.fy = event.y;
-}
-
-/**
- * Handle drag end
- */
-function dragEnded(event, d) {
-    if (!event.active) simulation.alphaTarget(0);
-    d.fx = null;
-    d.fy = null;
-}
-
-// ===== POSITION UPDATES =====
-
-/**
- * Update link positions
- */
-function updateLinkPositions(linkElements) {
-    linkElements
-        .attr('x1', d => d.source.x)
-        .attr('y1', d => d.source.y)
-        .attr('x2', d => d.target.x)
-        .attr('y2', d => d.target.y);
-}
-
-/**
- * Update node positions - FIXED VERSION
- */
-function updateNodePositions(nodeElements) {
-    nodeElements.each(function(d) {
-        const group = d3.select(this);
-        
-        // Update the group transform
-        group.attr('transform', `translate(${d.x},${d.y})`);
-        
-        // CRITICAL FIX: Also update circle cx/cy attributes
-        group.select('circle')
-            .attr('cx', 0)  // Relative to group position
-            .attr('cy', 0); // Relative to group position
+    model.nodes.filter((n) => n.kind === 'title').forEach((t, i) => {
+      const sx = d3.sum(t.actors, (x) => Math.cos(x.actorNode.angle));
+      const sy = d3.sum(t.actors, (x) => Math.sin(x.actorNode.angle));
+      const ang = Math.atan2(sy, sx) + ((i % 5) - 2) * 0.12;
+      const dist = t.actors.length > 1 ? ring * 0.95 + 40 : ring + 150 + (i % 3) * 30;
+      t.x = Math.cos(ang) * dist;
+      t.y = Math.sin(ang) * dist;
     });
-}
 
-// ===== ACTOR POPUP FUNCTIONALITY =====
+    const sim = d3.forceSimulation(model.nodes)
+      .force('link', d3.forceLink(model.links)
+        .distance((l) => (l.kind === 'cast' ? ring : l.target.actors.length > 1 ? 150 : 115))
+        .strength((l) => (l.kind === 'cast' ? 0.7 : 0.5)))
+      .force('charge', d3.forceManyBody().strength((n) => (n.kind === 'actor' ? -520 : n.kind === 'center' ? -900 : -230)))
+      .force('collide', d3.forceCollide((n) => n.r + (n.kind === 'actor' ? 30 : 16)).iterations(2))
+      .force('radial', d3.forceRadial(ring + 165, 0, 0).strength((n) => (n.kind === 'title' && n.actors.length === 1 ? 0.06 : 0)))
+      .stop();
+    for (let i = 0; i < 420; i++) sim.tick();
+    return ring;
+  }
 
-/**
- * Show popup with shared actors between two movies
- */
-function showActorPopup(event, clickedMovie, mainMovie) {
-    const popup = document.getElementById('actorPopup');
-    const title = document.getElementById('popupTitle');
-    const photos = document.getElementById('actorPhotos');
-    
-    if (!popup || !title || !photos) {
-        console.error('Popup elements not found');
-        return;
+  // ---------- drawing ----------
+  function drawDisc(g, n, label, imageUrl) {
+    el('circle', { r: n.r, class: 'node-fill', fill: MONO_FILLS[hash(n.id) % MONO_FILLS.length] }, g);
+    const mono = el('text', { class: 'node-mono', 'text-anchor': 'middle', dy: '0.36em', 'font-size': Math.round(n.r * 0.62) }, g);
+    mono.textContent = initials(label);
+    if (imageUrl) {
+      const im = el('image', {
+        href: imageUrl, x: -n.r, y: -n.r, width: n.r * 2, height: n.r * 2,
+        preserveAspectRatio: 'xMidYMid slice', 'clip-path': 'url(#aw-clip)', class: 'node-image',
+      }, g);
+      im.addEventListener('error', () => im.remove());
+      im.addEventListener('load', () => g.classList.add('has-image'));
     }
-    
-    // Find shared actors from the link data
-    const linkData = currentGraph.links.find(link => 
-        (link.source.id === clickedMovie.id && link.target.id === mainMovie.id) ||
-        (link.target.id === clickedMovie.id && link.source.id === mainMovie.id)
-    );
-    
-    const sharedActors = linkData ? linkData.sharedActors : [];
-    
-    // Set popup title
-    title.textContent = `Shared Actors: ${mainMovie.title} ↔ ${clickedMovie.title}`;
-    
-    // Create actor photos HTML
-    if (sharedActors.length === 0) {
-        photos.innerHTML = createNoActorsHTML();
+    el('circle', { r: n.r, class: 'node-rim' }, g);
+  }
+
+  function drawLabel(g, n) {
+    if (n.kind === 'center') return;
+    const y = n.r + 15;
+    const t = el('text', { class: 'node-label', 'text-anchor': 'middle', y }, g);
+    if (n.kind === 'actor') {
+      t.textContent = n.person.name;
+      if (n.character) {
+        const c = el('text', { class: 'node-sub', 'text-anchor': 'middle', y: y + 14 }, g);
+        c.textContent = truncate(n.character, 26);
+      }
     } else {
-        photos.innerHTML = sharedActors.map(actor => 
-            createActorPhotoHTML(actor, mainMovie, clickedMovie)
-        ).join('');
+      t.textContent = truncate(n.title.title, 28);
+      const c = el('text', { class: 'node-sub', 'text-anchor': 'middle', y: y + 13 }, g);
+      c.textContent = (n.title.year || '') + (n.title.type === 'tv' ? ' series' : '');
     }
-    
-    // Position popup
-    positionPopup(popup, event);
-    
-    // Show popup with animation
-    popup.classList.add('show');
-    
-    debugLog('Actor popup shown for:', sharedActors.length, 'shared actors');
-}
+  }
 
-/**
- * Create HTML for when no shared actors are found
- */
-function createNoActorsHTML() {
-    return `
-        <div style="text-align: center; color: ${getColor('text.muted')}; padding: 20px;">
-            <div style="font-size: 18px; margin-bottom: 10px;">🎭</div>
-            <div>No shared actors found</div>
-            <div style="font-size: 12px; margin-top: 5px;">
-                This connection might be through crew or other relationships
-            </div>
-        </div>
-    `;
-}
+  function describe(n) {
+    if (n.kind === 'center') return n.title.title + ', the center of the web. Open its cast.';
+    if (n.kind === 'actor') return n.person.name + (n.character ? ' as ' + n.character : '') + '. Open photos.';
+    const who = n.actors.map((a) => a.person.name).join(', ');
+    return n.title.title + (n.title.year ? ' (' + n.title.year + ')' : '') + ', with ' + who + (n.title.seen ? '. Watched.' : '.');
+  }
 
-/**
- * Create HTML for an actor photo
- */
-function createActorPhotoHTML(actor, mainMovie, clickedMovie) {
-    const actorImage = getActorImageUrl(actor.name, 150, 200);
-    
-    return `
-        <div class="actor-photo">
-            <img src="${actorImage}" alt="${escapeHtml(actor.name)}" 
-                 onerror="this.style.display='none'; this.nextElementSibling.style.display='block';">
-            <div style="display: none; width: 150px; height: 200px; background: ${getColor('primary')}; 
-                        border-radius: 10px; display: flex; align-items: center; justify-content: center; 
-                        color: white; text-align: center; font-size: 14px; font-weight: bold;">
-                ${escapeHtml(actor.name)}
-            </div>
-            <div class="photo-label">${escapeHtml(actor.name)}</div>
-            <div class="photo-label" style="font-size: 12px; color: ${getColor('text.muted')}; margin-top: 5px;">
-                <div><strong>${escapeHtml(mainMovie.title)}</strong> (${mainMovie.year})</div>
-                <div style="margin: 2px 0;">as ${escapeHtml(getCharacterName(actor, mainMovie))}</div>
-                <div style="border-top: 1px solid ${getColor('text.muted')}; padding-top: 5px; margin-top: 5px;">
-                    <strong>${escapeHtml(clickedMovie.title)}</strong> (${clickedMovie.year})
-                </div>
-                <div>as ${escapeHtml(getCharacterName(actor, clickedMovie))}</div>
-            </div>
-        </div>
-    `;
-}
+  function render(web, handlers) {
+    svg = document.getElementById('web');
+    svg.innerHTML = '';
+    current = { web, handlers };
+    const model = buildModel(web);
+    const ring = layout(model);
+    nodesById = new Map(model.nodes.map((n) => [n.id, n]));
 
-/**
- * Get character name for an actor in a specific movie
- */
-function getCharacterName(actor, movie) {
-    const movieActor = movie.actors.find(a => a.id === actor.id);
-    return movieActor ? movieActor.character : actor.character || 'Unknown Character';
-}
+    const defs = el('defs', {}, svg);
+    const clip = el('clipPath', { id: 'aw-clip', clipPathUnits: 'objectBoundingBox' }, defs);
+    el('circle', { cx: 0.5, cy: 0.5, r: 0.5 }, clip);
 
-/**
- * Position popup relative to click event
- */
-function positionPopup(popup, event) {
-    const rect = event.target.getBoundingClientRect();
-    const popupWidth = CONFIG.ui.popupMaxWidth;
-    const popupHeight = 400; // Estimated height
-    
-    let left = rect.left;
-    let top = rect.top + 50;
-    
-    // Adjust if popup would go off screen
-    if (left + popupWidth > window.innerWidth) {
-        left = window.innerWidth - popupWidth - 20;
-    }
-    
-    if (top + popupHeight > window.innerHeight) {
-        top = window.innerHeight - popupHeight - 20;
-    }
-    
-    // Ensure minimum margins
-    left = Math.max(20, left);
-    top = Math.max(20, top);
-    
-    popup.style.left = left + 'px';
-    popup.style.top = top + 'px';
-}
+    viewport = el('g', { class: 'viewport' }, svg);
+    const linkLayer = el('g', { class: 'links' }, viewport);
+    const nodeLayer = el('g', { class: 'nodes' }, viewport);
 
-/**
- * Close actor popup
- */
-function closePopup() {
-    const popup = document.getElementById('actorPopup');
-    if (popup) {
-        popup.classList.remove('show');
-    }
-}
+    const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-// ===== GRAPH UTILITIES =====
+    model.links.forEach((l) => {
+      const line = el('line', {
+        x1: l.source.x, y1: l.source.y, x2: l.target.x, y2: l.target.y,
+        class: 'link link-' + l.kind,
+      }, linkLayer);
+      l.el = line;
+      if (!reduce) {
+        const len = Math.hypot(l.target.x - l.source.x, l.target.y - l.source.y);
+        line.style.strokeDasharray = len;
+        line.style.strokeDashoffset = len;
+        const delay = l.kind === 'cast' ? 80 + l.target.index * 45 : 520 + Math.hypot(l.target.x, l.target.y) * 0.55;
+        line.style.animation = `aw-draw 520ms ${delay}ms cubic-bezier(.3,.6,.2,1) forwards`;
+      }
+    });
 
-/**
- * Clear the current graph
- */
-function clearGraph() {
-    if (svg) {
-        svg.selectAll('*').remove();
-    }
-    
-    if (simulation) {
-        simulation.stop();
-        simulation = null;
-    }
-    
-    currentGraph = null;
-    debugLog('Graph cleared');
-}
+    model.nodes
+      .slice()
+      .sort((a, b) => (a.kind === 'title') - (b.kind === 'title'))
+      .reverse()
+      .forEach((n) => {
+        const g = el('g', {
+          class: 'node node-' + n.kind + (n.kind === 'title' && n.actors.length > 1 ? ' is-hub' : '') + (n.title && n.title.seen ? ' is-seen' : ''),
+          transform: `translate(${n.x},${n.y})`,
+          tabindex: 0, role: 'button', 'aria-label': describe(n),
+        }, nodeLayer);
+        n.el = g;
+        const inner = el('g', { class: 'node-inner' }, g);
+        if (n.kind === 'actor') drawDisc(inner, n, n.person.name, n.person.thumb);
+        else drawDisc(inner, n, n.title.title, n.title.poster);
+        if (n.title && n.title.seen) {
+          el('path', { d: AW.pencilLoop(n.r + (n.kind === 'center' ? 11 : 7), hash(n.id)), class: 'pencil' }, inner);
+        }
+        drawLabel(inner, n);
+        if (!reduce) {
+          const delay = n.kind === 'center' ? 0 : n.kind === 'actor' ? 160 + n.index * 45 : 760 + Math.hypot(n.x, n.y) * 0.55;
+          inner.style.animation = `aw-pop 420ms ${delay}ms cubic-bezier(.2,.9,.3,1.25) both`;
+        }
 
-/**
- * Get current graph data
- */
-function getCurrentGraph() {
-    return currentGraph;
-}
-
-/**
- * Restart simulation with new alpha
- */
-function restartSimulation(alpha = 0.3) {
-    if (simulation) {
-        simulation.alpha(alpha).restart();
-    }
-}
-
-/**
- * Update graph colors based on current theme
- */
-function updateGraphColors() {
-    if (!svg || !currentGraph) return;
-    
-    // Update node colors
-    svg.selectAll('.node circle')
-        .style('fill', d => d.isMain ? getColor('accent') : getColor('primary'))
-        .style('stroke', getColor('text.primary'));
-    
-    // Update link colors
-    svg.selectAll('.link')
-        .style('stroke', getColor('primary') + '66');
-    
-    // Update text colors
-    svg.selectAll('.node-label')
-        .style('fill', (d, i, nodes) => {
-            const element = d3.select(nodes[i]);
-            return element.classed('year-label') ? 
-                getColor('text.secondary') : 
-                getColor('text.primary');
+        g.addEventListener('mouseenter', () => focusOn(n));
+        g.addEventListener('mouseleave', clearFocus);
+        g.addEventListener('focus', () => focusOn(n));
+        g.addEventListener('blur', clearFocus);
+        g.addEventListener('click', () => activate(n));
+        g.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate(n); }
         });
-    
-    debugLog('Graph colors updated');
-}
+      });
 
-/**
- * Animate graph entrance
- */
-function animateGraphEntrance() {
+    // Draw the center last so it sits on top.
+    nodeLayer.appendChild(model.center.el);
+
+    model.links.forEach((l) => { (l.source.links = l.source.links || []).push(l); (l.target.links = l.target.links || []).push(l); });
+
+    setupZoom(model, ring);
+  }
+
+  function setupZoom(model) {
+    const sel = d3.select(svg);
+    zoom = d3.zoom()
+      .scaleExtent([0.25, 4])
+      .on('zoom', (e) => {
+        viewport.setAttribute('transform', e.transform.toString());
+        svg.classList.toggle('is-close', e.transform.k > 1.35);
+      });
+    sel.call(zoom).on('dblclick.zoom', null);
+    fit(model.nodes, false);
+  }
+
+  function fit(nodes, animate) {
+    const list = nodes || [...nodesById.values()];
+    const box = svg.getBoundingClientRect();
+    const pad = { top: 92, bottom: window.innerWidth < 700 ? 150 : 120, side: 24 };
+    const x0 = d3.min(list, (n) => n.x - n.r - 40);
+    const x1 = d3.max(list, (n) => n.x + n.r + 40);
+    const y0 = d3.min(list, (n) => n.y - n.r - 10);
+    const y1 = d3.max(list, (n) => n.y + n.r + 44);
+    const w = box.width - pad.side * 2;
+    const h = box.height - pad.top - pad.bottom;
+    const k = Math.min(w / (x1 - x0), h / (y1 - y0), 1.25);
+    const tx = pad.side + w / 2 - k * (x0 + x1) / 2;
+    const ty = pad.top + h / 2 - k * (y0 + y1) / 2;
+    const t = d3.zoomIdentity.translate(tx, ty).scale(k);
+    const sel = d3.select(svg);
+    (animate ? sel.transition().duration(500) : sel).call(zoom.transform, t);
+  }
+
+  function focusOn(n) {
+    svg.classList.add('is-focusing');
+    n.el.classList.add('is-lit');
+    (n.links || []).forEach((l) => {
+      l.el.classList.add('is-lit');
+      const other = l.source === n ? l.target : l.source;
+      other.el.classList.add('is-near');
+    });
+  }
+
+  function clearFocus() {
     if (!svg) return;
-    
-    // Animate nodes
-    svg.selectAll('.node')
-        .style('opacity', 0)
-        .style('transform', 'scale(0)')
-        .transition()
-        .duration(500)
-        .delay((d, i) => i * 100)
-        .style('opacity', 1)
-        .style('transform', 'scale(1)');
-    
-    // Animate links
-    svg.selectAll('.link')
-        .style('stroke-dasharray', '5,5')
-        .style('stroke-dashoffset', 10)
-        .style('opacity', 0)
-        .transition()
-        .duration(1000)
-        .delay(300)
-        .style('opacity', 0.6)
-        .style('stroke-dashoffset', 0);
-}
+    svg.classList.remove('is-focusing');
+    svg.querySelectorAll('.is-lit, .is-near').forEach((x) => x.classList.remove('is-lit', 'is-near'));
+  }
 
-/**
- * Focus on a specific node
- */
-function focusOnNode(nodeId) {
-    if (!simulation || !currentGraph) return;
-    
-    const node = currentGraph.nodes.find(n => n.id === nodeId);
-    if (!node) return;
-    
-    const width = parseInt(svg.attr('width'));
-    const height = parseInt(svg.attr('height'));
-    
-    // Update center force to focus on the node
-    simulation
-        .force('center', d3.forceCenter(width / 2, height / 2))
-        .alpha(0.3)
-        .restart();
-    
-    // Highlight the focused node
-    svg.selectAll('.node')
-        .style('opacity', d => d.id === nodeId ? 1 : 0.5);
-    
-    setTimeout(() => {
-        svg.selectAll('.node').style('opacity', 1);
-    }, 2000);
-}
+  function originOf(n) {
+    const r = n.el.getBoundingClientRect();
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  }
 
-// ===== UTILITY FUNCTIONS =====
-
-/**
- * Truncate text to specified length
- */
-function truncateText(text, maxLength) {
-    if (!text) return '';
-    return text.length > maxLength ? text.substring(0, maxLength) + '...' : text;
-}
-
-/**
- * Get node color based on type and state
- */
-function getNodeColor(node, state = 'default') {
-    if (node.isMain) {
-        return getColor('accent');
+  function activate(n) {
+    const h = current.handlers;
+    const origin = originOf(n);
+    const center = current.web.center;
+    if (n.kind === 'actor') {
+      h.open([{ person: n.person, character: n.character }], center, origin, n.el);
+    } else if (n.kind === 'center') {
+      h.open(current.web.cast.map((m) => ({ person: m.person, character: m.character })), center, origin, n.el);
+    } else {
+      h.open(n.actors.map((a) => ({ person: a.person, character: a.character })), n.title, origin, n.el);
     }
-    
-    switch (state) {
-        case 'hover':
-            return getColor('secondary');
-        case 'selected':
-            return getColor('primary');
-        default:
-            return getColor('primary');
-    }
-}
+  }
 
-/**
- * Calculate optimal node size based on connections
- */
-function calculateNodeSize(node) {
-    const baseSize = node.isMain ? CONFIG.graph.mainNodeSize : CONFIG.graph.connectedNodeSize;
-    
-    if (node.isMain) {
-        return baseSize;
-    }
-    
-    // Adjust size based on number of shared actors
-    const sharedActorsCount = node.sharedActors ? node.sharedActors.length : 1;
-    const sizeMultiplier = 1 + (sharedActorsCount - 1) * 0.2; // 20% increase per additional shared actor
-    
-    return Math.min(baseSize * sizeMultiplier, baseSize * 2); // Cap at 2x the base size
-}
+  function clear() {
+    if (svg) svg.innerHTML = '';
+    current = null;
+  }
 
-// ===== EXPORT FOR MODULE SYSTEMS =====
-if (typeof module !== 'undefined' && module.exports) {
-    module.exports = {
-        initializeGraph,
-        createGraph,
-        renderGraph,
-        clearGraph,
-        getCurrentGraph,
-        restartSimulation,
-        updateGraphColors,
-        animateGraphEntrance,
-        focusOnNode,
-        showActorPopup,
-        closePopup,
-        updateGraphDimensions
-    };
-}
+  window.addEventListener('resize', () => { if (current) fit(null, false); });
+
+  AW.graph = { render, clear, fit: () => current && fit(null, true), initials };
+})();
